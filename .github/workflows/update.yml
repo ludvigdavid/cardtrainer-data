@@ -1,0 +1,35 @@
+# Rebuilds the card feed every night and publishes it with GitHub Pages (from the docs folder).
+name: Update card feed
+on:
+  schedule:
+    - cron: '23 3 * * *' # every day at 03:23 UTC
+  workflow_dispatch: # "Run workflow" button on the Actions tab
+permissions:
+  contents: write
+concurrency:
+  group: card-feed
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Get the TCGdex card database
+        run: git clone --depth 1 https://github.com/tcgdex/cards-database.git cards-database
+      - name: Build the feed
+        run: node build.mjs
+        env:
+          TCGDEX_DIR: cards-database
+          OUT: docs
+      - name: Publish
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs
+          if git diff --cached --quiet; then echo "No changes today"; exit 0; fi
+          git commit -m "Card feed $(date -u +%Y-%m-%d)"
+          git push

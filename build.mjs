@@ -18,6 +18,10 @@ const OUT = process.env.OUT || join(HERE, 'site');
 const DATAS = process.env.DATAS || 'https://assets.tcgdex.net/datas.json';
 const PRICES = process.env.PRICES || 'https://downloads.s3.cardmarket.com/productCatalog/priceGuide/price_guide_6.json';
 const ASSETS = 'https://assets.tcgdex.net';
+// Where this feed is published (set symbols are kept here too, see saveSymbols).
+const PUBLIC_URL = process.env.PUBLIC_URL || 'https://ludvigdavid.github.io/cardtrainer-data';
+// The old card database's symbol pictures, copied once into the feed while they still exist.
+const OLD_SYMBOL = (id) => `https://images.pokemontcg.io/${id}/symbol.png`;
 
 // The app's sets (its own ids are kept, so saved progress still matches) → TCGdex's id.
 const APP_SETS = JSON.parse(readFileSync(join(HERE, 'sets.json'), 'utf8'));
@@ -54,6 +58,52 @@ async function loadJson(src) {
     }
   }
   return null;
+}
+
+/**
+ * Keeps a copy of every set's symbol picture in the feed (symbols/<set>.png), so it doesn't depend on
+ * anyone else's server. Downloaded once; files already there are kept. Returns the sets that have one.
+ */
+async function saveSymbols(ids, tcgdexUrls) {
+  const dir = join(OUT, 'symbols');
+  mkdirSync(dir, { recursive: true });
+  const have = new Set();
+  const todo = [];
+  for (const id of ids) (existsSync(join(dir, `${id}.png`)) ? have.add(id) : todo.push(id));
+  let fetched = 0;
+  for (let i = 0; i < todo.length; i += 8) {
+    await Promise.all(
+      todo.slice(i, i + 8).map(async (id) => {
+        for (const url of [OLD_SYMBOL(id), tcgdexUrls[id]].filter(Boolean)) {
+          try {
+            const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
+            const type = res.headers.get('content-type') ?? '';
+            if (!res.ok || !type.startsWith('image/')) continue;
+            const buf = Buffer.from(await res.arrayBuffer());
+            if (buf.length < 100) continue; // not a real picture
+            writeFileSync(join(dir, `${id}.png`), buf);
+            have.add(id);
+            fetched++;
+            return;
+          } catch {
+            /* try the next source */
+          }
+        }
+      }),
+    );
+  }
+  console.log(`Set symbols: ${have.size}/${ids.length} saved in the feed (${fetched} new).`);
+  return have;
+}
+
+/** Whether a picture exists (a light HEAD request). Used for set symbols the picture list doesn't mention. */
+async function exists(url) {
+  try {
+    const res = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(15000) });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 const good = (v) => typeof v === 'number' && Number.isFinite(v) && v > 0;
@@ -148,13 +198,46 @@ async function main() {
     }
     cards.sort((a, b) => (parseInt(a.no, 10) || 1e9) - (parseInt(b.no, 10) || 1e9) || a.no.localeCompare(b.no));
     total += cards.length;
-    const symbol = datas?.univ?.[set.serieId]?.[tid]?.symbol ? `${ASSETS}/univ/${set.serieId}/${tid}/symbol.png` : undefined;
+    const symbolUrl = `${ASSETS}/univ/${set.serieId}/${tid}/symbol.png`;
+    const symbol = datas?.univ?.[set.serieId]?.[tid]?.symbol ? symbolUrl : undefined;
     const release = typeof set.releaseDate === 'string' ? set.releaseDate : set.releaseDate?.en;
     const facts = { name: app.name, year: release ? Number(release.slice(0, 4)) : undefined, total: set.cardCount?.official, symbol, count: cards.length };
-    index.sets[app.id] = facts;
+    index.sets[app.id] = { ...facts, symbolGuess: symbol ? undefined : symbolUrl };
     writeFileSync(join(OUT, 'sets', `${app.id}.json`), JSON.stringify({ v: 1, id: app.id, updated: index.updated, ...facts, cards }));
   }
+  // Set symbols: our own saved copy first; otherwise TCGdex's, if their server has it.
+  const saved = await saveSymbols(Object.keys(index.sets), Object.fromEntries(Object.entries(index.sets).map(([id, f]) => [id, f.symbol ?? f.symbolGuess])));
+  for (const [id, f] of Object.entries(index.sets)) {
+    if (saved.has(id)) {
+      f.symbol = `${PUBLIC_URL}/symbols/${id}.png`;
+      delete f.symbolGuess;
+    }
+  }
+  const unknown = Object.entries(index.sets).filter(([, f]) => !f.symbol && f.symbolGuess);
+  let found = 0;
+  for (let i = 0; i < unknown.length; i += 8) {
+    await Promise.all(
+      unknown.slice(i, i + 8).map(async ([, f]) => {
+        if (await exists(f.symbolGuess)) {
+          f.symbol = f.symbolGuess;
+          found++;
+        }
+      }),
+    );
+  }
+  for (const [id, f] of Object.entries(index.sets)) {
+    delete f.symbolGuess;
+    if (saved.has(id) || unknown.some(([u]) => u === id)) {
+      // write the symbol into that set's own file too
+      const file = join(OUT, 'sets', `${id}.json`);
+      const j = JSON.parse(readFileSync(file, 'utf8'));
+      j.symbol = f.symbol;
+      writeFileSync(file, JSON.stringify(j));
+    }
+  }
   writeFileSync(join(OUT, 'index.json'), JSON.stringify(index));
+  const withSymbol = Object.values(index.sets).filter((f) => f.symbol).length;
+  console.log(`Picture list: ${datas ? 'ok' : 'UNAVAILABLE'} · prices: ${priceGuide?.priceGuides ? 'ok' : 'UNAVAILABLE'} · set symbols: ${withSymbol}/${Object.keys(index.sets).length} (${found} found by asking directly)`);
   writeFileSync(join(OUT, '.nojekyll'), '');
   console.log(`${Object.keys(index.sets).length} sets, ${total} cards, ${priced} with a price, ${missingPics} without a picture.`);
   if (problems.length) console.warn('Sets not found:\n  ' + problems.join('\n  '));
